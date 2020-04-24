@@ -19,7 +19,7 @@ This repository contains code and data that went into creating the figure in the
 | `race.py` | supporting classes used in `ft.py` |
 | `sortnp.go` |  in-place parallel sorting algorithm |
 | `test_ft.py` | unit tests for `ft.py` |
-| `tsan_patch.diff` | a patch to the TSan library in order to call out to data-race detector ft.py implemented in Python |
+| `tsan_patch.diff` | a patch to the TSan library in order to call out to data-race detector `ft.py` implemented in Python |
 
 ### Raw data
 
@@ -27,3 +27,25 @@ This repository contains code and data that went into creating the figure in the
 data/sortnp.ft.out
 data/sortnp.fix.ft.out
 ```
+
+### Re-generating the data 
+
+To generate data before the fix.
+
+- Clone LLVM
+- Apply patch `tsan_patch.diff` to TSan
+- Build TSan Go library file `race_<OS>_<PLATFORM>_.syso`
+- Copy library file to `` `go env GOTOOLDIR`/../../../src/runtime/race``
+- Compile `sortnp.go` (potentially using `build.py`)
+- Run `sortnp.go` setting PYTHONPATH to the location of `ft.py`
+
+To generate data after the fix.
+
+- Having checked-out LLVM and applied patch `tsan_patch.diff` to TSan, modify line `#define RD 0` in `tsan_go.cpp` so it reads `#define RD FT`
+- Rebuild TSan Go library file
+- Clone Go
+- Apply [patch](https://go-review.googlesource.com/c/go/+/220419/) to Go
+- Assuming Go's clone path is `go.git`, copy TSan Go library file to `go.git/src/runtime/race`
+- Build Go
+- Compile `sortnp.go` using the modified Go (can pass a version of Go to `build.py` script)
+- Run `sortnp.go` setting PYTHONPATH to the location of `ft.py`

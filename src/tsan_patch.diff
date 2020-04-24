@@ -38,7 +38,7 @@ index 77987f43bf5..ae8ee9da835 100644
  
 +#define FT 1
 +
-+#define RD FT
++#define RD 0
 +#define RDPRINT 0
 +
 +#if(RD)
