@@ -1,0 +1,455 @@
+diff --git a/compiler-rt/lib/tsan/go/buildgo.sh b/compiler-rt/lib/tsan/go/buildgo.sh
+index 9e21b77d5a0..cb986b8aea7 100755
+--- a/compiler-rt/lib/tsan/go/buildgo.sh
++++ b/compiler-rt/lib/tsan/go/buildgo.sh
+@@ -157,7 +153,7 @@ for F in $SRCS; do
+ 	cat $F >> $DIR/gotsan.cpp
+ done
+ 
+-FLAGS=" -I../rtl -I../.. -I../../sanitizer_common -I../../../include -std=c++14 -Wall -fno-exceptions -fno-rtti -DSANITIZER_GO=1 -DSANITIZER_DEADLOCK_DETECTOR_VERSION=2 $OSCFLAGS $ARCHCFLAGS"
++FLAGS=" -I../rtl -I../.. -I../../sanitizer_common -I../../../include -std=c++14 -Wall -fno-exceptions -fno-rtti -DSANITIZER_GO=1 -DSANITIZER_DEADLOCK_DETECTOR_VERSION=2 $OSCFLAGS $ARCHCFLAGS `python3-config --cflags`"
+ DEBUG_FLAGS="$FLAGS -DSANITIZER_DEBUG=1 -g"
+ FLAGS="$FLAGS -DSANITIZER_DEBUG=0 -O3 -fomit-frame-pointer"
+ if [ "$SUFFIX" = "linux_ppc64le" ]; then
+@@ -178,7 +174,7 @@ if [ "$SILENT" != "1" ]; then
+ fi
+ $CC $DIR/gotsan.cpp -c -o $DIR/race_$SUFFIX.syso $FLAGS $CFLAGS
+ 
+-$CC $OSCFLAGS $ARCHCFLAGS test.c $DIR/race_$SUFFIX.syso -g -o $DIR/test $OSLDFLAGS $LDFLAGS
++$CC $OSCFLAGS $ARCHCFLAGS test.c $DIR/race_$SUFFIX.syso -g -o $DIR/test $OSLDFLAGS $LDFLAGS `python3-config --ldflags`
+ 
+ # Verify that no libc specific code is present.
+ if [ "$DEPENDS_ON_LIBC" != "1" ]; then
+diff --git a/compiler-rt/lib/tsan/go/tsan_go.cpp b/compiler-rt/lib/tsan/go/tsan_go.cpp
+index 77987f43bf5..ae8ee9da835 100644
+--- a/compiler-rt/lib/tsan/go/tsan_go.cpp
++++ b/compiler-rt/lib/tsan/go/tsan_go.cpp
+@@ -10,13 +10,36 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++
+ #include "tsan_rtl.h"
+ #include "tsan_symbolize.h"
+ #include "sanitizer_common/sanitizer_common.h"
+ #include <stdlib.h>
+ 
++#define FT 1
++
++#define RD FT
++#define RDPRINT 0
++
++#if(RD)
++PyObject *pObj;
++#endif
++
+ namespace __tsan {
+ 
++#if(RDPRINT)
++uptr closechanPC = 0;
++uptr chansendPC = 0;
++#endif
++
++#if(RD)
++Mutex sgl(MutexTypeReport, StatMtxReport);
++#endif
++
+ void InitializeInterceptors() {
+ }
+ 
+@@ -150,6 +173,45 @@ static ThreadState *AllocGoroutine() {
+ 
+ void __tsan_init(ThreadState **thrp, Processor **procp,
+                  void (*cb)(uptr cmd, void *cb)) {
++
++#if(RD)
++  PyObject *pName, *pModule, *pCls;
++
++  Py_Initialize();
++#if(RD==FT)
++  const char* script_fname = "ft";
++  const char* class_name = "FT";
++#endif
++
++  pName = PyUnicode_DecodeFSDefault(script_fname);
++  /* Error checking of pName left out */
++
++  pModule = PyImport_Import(pName);
++  Py_DECREF(pName);
++
++  if (pModule != NULL) {
++    pCls = PyObject_GetAttrString(pModule, class_name);
++
++      if (pCls && PyCallable_Check(pCls)) {
++        pObj = PyObject_CallObject(pCls, NULL);
++        Py_DECREF(pCls);
++      } else {
++        if (PyErr_Occurred())
++          PyErr_Print();
++        fprintf(stderr, "Cannot find \"%s\"\n", class_name);
++      }
++  } else {
++    PyErr_Print();
++    fprintf(stderr, "Failed to load \"%s\"\n", script_fname);
++  }
++#endif
++
+   go_runtime_cb = cb;
+   ThreadState *thr = AllocGoroutine();
+   main_thr = *thrp = thr;
+@@ -166,50 +228,176 @@ void __tsan_fini() {
+ }
+ 
+ void __tsan_map_shadow(uptr addr, uptr size) {
++#if(RDPRINT)
++  Printf("%s,%p,0x%llx\n", __func__, addr, size);
++#endif
+   MapShadow(addr, size);
+ }
+ 
+ void __tsan_read(ThreadState *thr, void *addr, void *pc) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, pc);
++#endif
+   MemoryRead(thr, (uptr)pc, (uptr)addr, kSizeLog1);
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "read", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_read_pc(ThreadState *thr, void *addr, uptr callpc, uptr pc) {
++#if(RDPRINT)
++  if (chansendPC == 0) {
++    SymbolizeCodeContext cbctx;
++    internal_memset(&cbctx, 0, sizeof(cbctx));
++    cbctx.pc = pc;
++    go_runtime_cb(CallbackSymbolizeCode, &cbctx);
++    if (internal_strcmp(cbctx.func, "runtime.chansend") == 0) {
++      chansendPC = pc;
++    }
++  }
++
++  if (chansendPC != 0 && pc == chansendPC) {
++    Printf("%s,%p,tid=%d,%p,%p,%p,%s\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, callpc, pc, "chansend");
++  } else {
++    Printf("%s,%p,tid=%d,%p,%p,%p,%s\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, callpc, pc);
++  }
++#endif
++
+   if (callpc != 0)
+     FuncEntry(thr, callpc);
+   MemoryRead(thr, (uptr)pc, (uptr)addr, kSizeLog1);
+   if (callpc != 0)
+     FuncExit(thr);
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "read", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_write(ThreadState *thr, void *addr, void *pc) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, pc);
++#endif
+   MemoryWrite(thr, (uptr)pc, (uptr)addr, kSizeLog1);
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "write", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_write_pc(ThreadState *thr, void *addr, uptr callpc, uptr pc) {
++#if(RDPRINT)
++  if (closechanPC == 0) {
++    SymbolizeCodeContext cbctx;
++    internal_memset(&cbctx, 0, sizeof(cbctx));
++    cbctx.pc = pc;
++    go_runtime_cb(CallbackSymbolizeCode, &cbctx);
++    if (internal_strcmp(cbctx.func, "runtime.closechan") == 0) {
++      closechanPC = pc;
++    }
++  }
++
++  if (closechanPC != 0 && pc == closechanPC) {
++    Printf("%s,%p,tid=%d,%p,%p,%p,%s\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, callpc, pc, "closechan");
++  } else {
++    Printf("%s,%p,tid=%d,%p,%p,%p,%s\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, callpc, pc);
++  }
++#endif
++
+   if (callpc != 0)
+     FuncEntry(thr, callpc);
+   MemoryWrite(thr, (uptr)pc, (uptr)addr, kSizeLog1);
+   if (callpc != 0)
+     FuncExit(thr);
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "write", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_read_range(ThreadState *thr, void *addr, uptr size, uptr pc) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p,0x%llx,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, size, pc);
++#endif
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "range", "(illi)", thr==NULL?kInvalidTid:thr->unique_id, addr, size, false);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
++
+   MemoryAccessRange(thr, (uptr)pc, (uptr)addr, size, false);
+ }
+ 
+ void __tsan_write_range(ThreadState *thr, void *addr, uptr size, uptr pc) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p,0x%llx,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr, size, pc);
++#endif
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "range", "(illi)", thr==NULL?kInvalidTid:thr->unique_id, addr, size, true);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
++
+   MemoryAccessRange(thr, (uptr)pc, (uptr)addr, size, true);
+ }
+ 
+ void __tsan_func_enter(ThreadState *thr, void *pc) {
++#if(RDPRINT)
++  SymbolizeCodeContext cbctx;
++  internal_memset(&cbctx, 0, sizeof(cbctx));
++  cbctx.pc = (uptr)pc;
++  go_runtime_cb(CallbackSymbolizeCode, &cbctx);
++  Printf("%s,%p,tid=%d,%p,%s\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), pc, cbctx.func);
++#endif
+   FuncEntry(thr, (uptr)pc);
+ }
+ 
+ void __tsan_func_exit(ThreadState *thr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id));
++#endif
+   FuncExit(thr);
+ }
+ 
+ void __tsan_malloc(ThreadState *thr, uptr pc, uptr p, uptr sz) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p,%p,0x%llx\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), (void*) pc, (void*) p, (u64) sz);
++#endif
+   CHECK(inited);
+   if (thr && pc)
+     ctx->metamap.AllocBlock(thr, pc, p, sz);
+@@ -217,7 +405,20 @@ void __tsan_malloc(ThreadState *thr, uptr pc, uptr p, uptr sz) {
+ }
+ 
+ void __tsan_free(uptr p, uptr sz) {
++#if(RDPRINT)
++  Printf("%s,%p,0x%llx\n", __func__, p, sz);
++#endif
+   ctx->metamap.FreeRange(get_cur_proc(), p, sz);
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "free", "(li)", p, sz);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_go_start(ThreadState *parent, ThreadState **pthr, void *pc) {
+@@ -225,9 +426,37 @@ void __tsan_go_start(ThreadState *parent, ThreadState **pthr, void *pc) {
+   *pthr = thr;
+   int goid = ThreadCreate(parent, (uptr)pc, 0, true);
+   ThreadStart(thr, goid, 0, ThreadType::Regular);
++
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p,tid=%d,%p\n", __func__, parent, parent->unique_id, thr, thr->unique_id, pc);
++#endif
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "fork", "(ii)", parent->unique_id, thr->unique_id);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
++
+ }
+ 
+ void __tsan_go_end(ThreadState *thr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id));
++#endif
++
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "end", "(i)", thr->unique_id);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
++
+   ThreadFinish(thr);
+   internal_free(thr);
+ }
+@@ -241,26 +470,80 @@ void __tsan_proc_destroy(Processor *proc) {
+ }
+ 
+ void __tsan_acquire(ThreadState *thr, void *addr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   Acquire(thr, 0, (uptr)addr);
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "acq", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_release_acquire(ThreadState *thr, void *addr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   ReleaseStoreAcquire(thr, 0, (uptr)addr);
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "rea", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_release(ThreadState *thr, void *addr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   ReleaseStore(thr, 0, (uptr)addr);
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "rel", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_release_merge(ThreadState *thr, void *addr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   Release(thr, 0, (uptr)addr);
++#if(RD == FT)
++  sgl.Lock();
++  PyObject* pValue = PyObject_CallMethod(pObj, "rem", "(il)", thr==NULL?kInvalidTid:thr->unique_id, addr);
++  if (pValue)
++    Py_DECREF(pValue);
++  else
++    PyErr_Print();
++  sgl.Unlock();
++#endif
+ }
+ 
+ void __tsan_finalizer_goroutine(ThreadState *thr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id));
++#endif
+   AcquireGlobal(thr, 0);
+ }
+ 
+ void __tsan_mutex_before_lock(ThreadState *thr, uptr addr, uptr write) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   if (write)
+     MutexPreLock(thr, 0, addr);
+   else
+@@ -268,6 +551,9 @@ void __tsan_mutex_before_lock(ThreadState *thr, uptr addr, uptr write) {
+ }
+ 
+ void __tsan_mutex_after_lock(ThreadState *thr, uptr addr, uptr write) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   if (write)
+     MutexPostLock(thr, 0, addr);
+   else
+@@ -275,6 +561,9 @@ void __tsan_mutex_after_lock(ThreadState *thr, uptr addr, uptr write) {
+ }
+ 
+ void __tsan_mutex_before_unlock(ThreadState *thr, uptr addr, uptr write) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d,%p\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id), addr);
++#endif
+   if (write)
+     MutexUnlock(thr, 0, addr);
+   else
+@@ -282,10 +571,16 @@ void __tsan_mutex_before_unlock(ThreadState *thr, uptr addr, uptr write) {
+ }
+ 
+ void __tsan_go_ignore_sync_begin(ThreadState *thr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id));
++#endif
+   ThreadIgnoreSyncBegin(thr, 0);
+ }
+ 
+ void __tsan_go_ignore_sync_end(ThreadState *thr) {
++#if(RDPRINT)
++  Printf("%s,%p,tid=%d\n", __func__, thr, (thr==NULL?kInvalidTid:thr->unique_id));
++#endif
+   ThreadIgnoreSyncEnd(thr, 0);
+ }
+ 
